@@ -1,0 +1,137 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: timeweave-db
+    environment:
+      POSTGRES_DB: timeweave
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d timeweave"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: timeweave-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.95.0
+    container_name: timeweave-otel-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "4317:4317" # OTLP gRPC
+      - "4318:4318" # OTLP HTTP
+    depends_on:
+      - backend
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: timeweave-backend
+    environment:
+      - ASPNETCORE_ENVIRONMENT=Development
+      - ASPNETCORE_URLS=http://+:5000
+      - ConnectionStrings__DefaultConnection=Host=postgres;Port=5432;Database=timeweave;Username=postgres;Password=postgres
+      - ConnectionStrings__Redis=redis:6379
+      - GEMINI_API_KEY=${GEMINI_API_KEY:-}
+      - DYNATRACE_API_URL=${DYNATRACE_API_URL:-}
+      - DYNATRACE_API_TOKEN=${DYNATRACE_API_TOKEN:-}
+      - GATEWAY_SERVICE_URL=http://service-gateway:8001
+    ports:
+      - "5000:5000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  # frontend:
+  #   build:
+  #     context: ./frontend
+  #     dockerfile: Dockerfile
+  #   container_name: timeweave-frontend
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     - NEXT_PUBLIC_BACKEND_URL=http://localhost:5000
+  #   depends_on:
+  #     - backend
+  # Frontend removed to save system resources. Run it locally via `npm run dev` in the frontend directory.
+
+  service-gateway:
+    build:
+      context: ./services/gateway
+      dockerfile: Dockerfile
+    container_name: timeweave-gateway
+    ports:
+      - "8001:8001"
+    environment:
+      - PORT=8001
+      - CHECKOUT_SERVICE_URL=http://service-checkout:8002
+      - OTEL_SERVICE_NAME=api-gateway
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+    depends_on:
+      - otel-collector
+
+  service-checkout:
+    build:
+      context: ./services/checkout
+      dockerfile: Dockerfile
+    container_name: timeweave-checkout
+    ports:
+      - "8002:8002"
+    environment:
+      - PORT=8002
+      - PAYMENT_SERVICE_URL=http://service-payment:8003
+      - REDIS_CACHE_SERVICE_URL=http://service-cache:8004
+      - OTEL_SERVICE_NAME=checkout-service
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+    depends_on:
+      - otel-collector
+
+  service-payment:
+    build:
+      context: ./services/payment
+      dockerfile: Dockerfile
+    container_name: timeweave-payment
+    ports:
+      - "8003:8003"
+    environment:
+      - PORT=8003
+      - OTEL_SERVICE_NAME=payment-service
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+    depends_on:
+      - otel-collector
+
+  service-cache:
+    build:
+      context: ./services/cache
+      dockerfile: Dockerfile
+    container_name: timeweave-cache
+    ports:
+      - "8004:8004"
+    environment:
+      - PORT=8004
+      - OTEL_SERVICE_NAME=redis-cache-service
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318
+    depends_on:
+      - otel-collector
+
+volumes:
+  pgdata:

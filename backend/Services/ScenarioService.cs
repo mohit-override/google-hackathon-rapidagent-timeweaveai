@@ -1,0 +1,152 @@
+using System;
+using System.Net.Http;
+using System.Threading.Tasks;
+using Microsoft.Extensions.Configuration;
+using TimeWeave.Backend.Database;
+
+namespace TimeWeave.Backend.Services
+{
+    public class ScenarioService
+    {
+        private readonly HttpClient _httpClient;
+        private readonly AppDbContext _dbContext;
+        private readonly string _gatewayUrl;
+        
+        public static Guid? ActiveSessionId { get; set; }
+        public static string? ActiveScenarioName { get; set; }
+
+        public ScenarioService(HttpClient httpClient, AppDbContext dbContext, IConfiguration configuration)
+        {
+            _httpClient = httpClient;
+            _dbContext = dbContext;
+            _gatewayUrl = configuration["GATEWAY_SERVICE_URL"] ?? "http://localhost:8001";
+        }
+
+        public async Task<ReplaySession> TriggerScenarioAsync(string scenario)
+        {
+            // 1. Create a Replay Session
+            var session = new ReplaySession
+            {
+                Id = Guid.NewGuid(),
+                Name = $"Incident Replay: {FormatScenarioName(scenario)}",
+                Description = GetScenarioDescription(scenario),
+                ScenarioName = scenario,
+                Status = "Running",
+                TriggeredAt = DateTime.UtcNow
+            };
+
+            _dbContext.ReplaySessions.Add(session);
+            await _dbContext.SaveChangesAsync();
+
+            // Set active session context
+            ActiveSessionId = session.Id;
+            ActiveScenarioName = scenario;
+
+            // 2. Execute HTTP call to Gateway in a separate background thread
+            // This allows the endpoint to return immediately so the frontend can display real-time telemetry!
+            _ = Task.Run(async () =>
+            {
+                try
+                {
+                    Console.WriteLine($"[ScenarioService] Triggering HTTP call to API Gateway for scenario '{scenario}'...");
+                    var url = $"{_gatewayUrl}/checkout?scenario={scenario}";
+                    
+                    // We set a high timeout since some scenarios take up to 6 seconds
+                    var client = new HttpClient { Timeout = TimeSpan.FromSeconds(10) };
+                    var response = await client.GetAsync(url);
+                    Console.WriteLine($"[ScenarioService] API Gateway call completed with status {response.StatusCode}");
+                    
+                    // Update session status once done
+                    session.Status = "Completed";
+                    _dbContext.ReplaySessions.Update(session);
+                    await _dbContext.SaveChangesAsync();
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[ScenarioService] Error triggering scenario: {ex.Message}");
+                    session.Status = "Failed";
+                    session.Description += $" (Trigger Error: {ex.Message})";
+                    _dbContext.ReplaySessions.Update(session);
+                    await _dbContext.SaveChangesAsync();
+                }
+            });
+
+            return session;
+        }
+
+        public async Task<SimulationResult> RunSimulationAsync(Guid sessionId, string scenario)
+        {
+            // Simulate the outcome of remediating the incident
+            var result = new SimulationResult
+            {
+                Id = Guid.NewGuid(),
+                SessionId = sessionId,
+                ScenarioName = scenario,
+                RunAt = DateTime.UtcNow
+            };
+
+            switch (scenario)
+            {
+                case "cache-latency":
+                    result.CappedRetries = false;
+                    result.LatencyImprovementMs = 2380; // Cache circuit breaker saves ~2.4 seconds
+                    result.OriginalFailureCount = 1;
+                    result.SimulatedFailureCount = 0;
+                    result.SimulationSummary = "With the Cache Circuit-Breaker enabled: Checkout Service detects the Redis latency spike within 100ms, skips the cache call, and retrieves session data from PostgreSQL directly. The end-to-end response time falls from 2.5s to 120ms, preventing transaction timeout.";
+                    break;
+                case "payment-timeout":
+                    result.CappedRetries = false;
+                    result.LatencyImprovementMs = 3950; // payment async queue
+                    result.OriginalFailureCount = 1;
+                    result.SimulatedFailureCount = 0;
+                    result.SimulationSummary = "With Asynchronous Payment Queuing enabled: The Checkout Service adds payment requests to a secure Redis Stream rather than blocking synchronous HTTP threads. Checkout responds to API Gateway in 45ms. The Payment worker processes the queue in the background, recovering from transient downstream lag without impacting checkout success.";
+                    break;
+                case "retry-storm":
+                    result.CappedRetries = true;
+                    result.LatencyImprovementMs = 1200; // retries capped
+                    result.OriginalFailureCount = 4; // 1 main + 3 retries
+                    result.SimulatedFailureCount = 1; // only 1 failure, no storm
+                    result.SimulationSummary = "With Capped Retries (Limit = 1) and Exponential Backoff: Checkout Service retries Payment only once instead of three times. This reduces payment traffic amplification by 75%, preventing database connection pool exhaustion and allowing the downstream Payment database to self-heal.";
+                    break;
+                case "cascading-failure":
+                    result.CappedRetries = true;
+                    result.LatencyImprovementMs = 2400;
+                    result.OriginalFailureCount = 5;
+                    result.SimulatedFailureCount = 0;
+                    result.SimulationSummary = "With Circuit Breaking on Cache: The cache dependency is isolated as soon as latency exceeds 200ms. Checkout threads are immediately freed up, preventing the downstream queue from saturating checkout thread resources and securing API Gateway responsiveness.";
+                    break;
+                default:
+                    result.SimulationSummary = "Remediation parameters applied. The system performed within normal operating parameters.";
+                    break;
+            }
+
+            _dbContext.SimulationResults.Add(result);
+            await _dbContext.SaveChangesAsync();
+            return result;
+        }
+
+        private string FormatScenarioName(string scenario)
+        {
+            return scenario switch
+            {
+                "cache-latency" => "Cache Latency Spike",
+                "payment-timeout" => "Payment Service Timeout",
+                "retry-storm" => "Retry Storm / Pool Exhaustion",
+                "cascading-failure" => "Cascading Service Failure",
+                _ => "Custom Incident"
+            };
+        }
+
+        private string GetScenarioDescription(string scenario)
+        {
+            return scenario switch
+            {
+                "cache-latency" => "Redis Cache latency spikes to 2.5s, exceeding Checkout Service client-side timeouts.",
+                "payment-timeout" => "Payment Service delays execution, causing Checkout Service to abort and API Gateway to return 504.",
+                "retry-storm" => "Payment DB pool exhaustion triggers error responses, amplifying traffic via rapid retries.",
+                "cascading-failure" => "Combined cache spike and payment retry loop exhausts checkout connection threads.",
+                _ => "Simulated distributed incident."
+            };
+        }
+    }
+}
